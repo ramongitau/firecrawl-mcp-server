@@ -7,12 +7,19 @@ import type { IncomingHttpHeaders } from 'http';
 
 dotenv.config({ debug: false, quiet: true });
 
-interface SessionData {
+export interface SessionData {
   firecrawlApiKey?: string;
   [key: string]: unknown;
 }
 
-function extractApiKey(headers: IncomingHttpHeaders): string | undefined {
+const CREDIT_WARNING_THRESHOLD = Number(
+  process.env.FIRECRAWL_CREDIT_WARNING_THRESHOLD || 1000
+);
+const CREDIT_CRITICAL_THRESHOLD = Number(
+  process.env.FIRECRAWL_CREDIT_CRITICAL_THRESHOLD || 100
+);
+
+export function extractApiKey(headers: IncomingHttpHeaders): string | undefined {
   const headerAuth = headers['authorization'];
   const headerApiKey = (headers['x-firecrawl-api-key'] ||
     headers['x-api-key']) as string | string[] | undefined;
@@ -31,7 +38,7 @@ function extractApiKey(headers: IncomingHttpHeaders): string | undefined {
   return undefined;
 }
 
-function removeEmptyTopLevel<T extends Record<string, any>>(
+export function removeEmptyTopLevel<T extends Record<string, any>>(
   obj: T
 ): Partial<T> {
   const out: Partial<T> = {};
@@ -84,7 +91,7 @@ class ConsoleLogger implements Logger {
   }
 }
 
-const server = new FastMCP<SessionData>({
+export const server = new FastMCP<SessionData>({
   name: 'firecrawl-fastmcp',
   version: '3.0.0',
   logger: new ConsoleLogger(),
@@ -159,6 +166,28 @@ function getClient(session?: SessionData): FirecrawlApp {
   }
 
   return createClient(session?.firecrawlApiKey);
+}
+
+async function monitorCredits(session?: SessionData) {
+  try {
+    const client = getClient(session);
+    const res = await client.v1.getCreditUsage();
+    if (res.success && 'data' in res) {
+      const remaining = res.data.remaining_credits;
+      if (remaining <= CREDIT_CRITICAL_THRESHOLD) {
+        console.error(
+          `[CRITICAL] Firecrawl credits are dangerously low: ${remaining} remaining`
+        );
+      } else if (remaining <= CREDIT_WARNING_THRESHOLD) {
+        console.warn(
+          `[WARNING] Firecrawl credits are low: ${remaining} remaining`
+        );
+      }
+    }
+  } catch (error) {
+    // Silently fail credit monitoring to avoid crashing the server
+    console.debug('Failed to check credits:', error);
+  }
 }
 
 function asText(data: unknown): string {
@@ -258,42 +287,68 @@ const scrapeParamsSchema = z.object({
   storeInCache: z.boolean().optional(),
   zeroDataRetention: z.boolean().optional(),
   maxAge: z.number().optional(),
+  timeout: z.number().optional(),
   proxy: z.enum(['basic', 'stealth', 'enhanced', 'auto']).optional(),
 });
+
+export async function scrapeHandler(
+  args: unknown,
+  { session, log }: { session?: SessionData; log: Logger }
+): Promise<string> {
+  const { url, ...options } = args as { url: string } & Record<string, unknown>;
+  const client = getClient(session);
+  const cleaned = removeEmptyTopLevel(options as Record<string, unknown>);
+  log.info('Scraping URL', { url: String(url) });
+  const res = await client.scrape(String(url), {
+    ...cleaned,
+    origin: ORIGIN,
+  } as any);
+  return asText(res);
+}
+
+export async function mapHandler(
+  args: unknown,
+  { session, log }: { session?: SessionData; log: Logger }
+): Promise<string> {
+  const { url, ...options } = args as { url: string } & Record<string, unknown>;
+  const client = getClient(session);
+  const cleaned = removeEmptyTopLevel(options as Record<string, unknown>);
+  log.info('Mapping URL', { url: String(url) });
+  const res = await client.map(String(url), {
+    ...cleaned,
+    origin: ORIGIN,
+  } as any);
+  return asText(res);
+}
+
+export async function searchHandler(
+  args: unknown,
+  { session, log }: { session?: SessionData; log: Logger }
+): Promise<string> {
+  const client = getClient(session);
+  const { query, ...opts } = args as Record<string, unknown>;
+  const cleaned = removeEmptyTopLevel(opts as Record<string, unknown>);
+  log.info('Searching', { query: String(query) });
+  const res = await client.search(query as string, {
+    ...(cleaned as any),
+    origin: ORIGIN,
+  });
+  return asText(res);
+}
 
 server.addTool({
   name: 'firecrawl_scrape',
   description: `
-Scrape content from a single URL with advanced options.
+Scrape content from a single URL with advanced options. 
 This is the most powerful, fastest and most reliable scraper tool, if available you should always default to using this tool for any web scraping needs.
 
 **Best for:** Single page content extraction, when you know exactly which page contains the information.
 **Not recommended for:** Multiple pages (call scrape multiple times or use crawl), unknown page location (use search).
 **Common mistakes:** Using markdown format when extracting specific data points (use JSON instead).
-**Other Features:** Use 'branding' format to extract brand identity (colors, fonts, typography, spacing, UI components) for design analysis or style replication.
+**Other Features:** Use 'branding' format to extract brand identity (colors, fonts, typography, spacing, logo, UI components) for design analysis or style replication.
 
 **CRITICAL - Format Selection (you MUST follow this):**
 When the user asks for SPECIFIC data points, you MUST use JSON format with a schema. Only use markdown when the user needs the ENTIRE page content.
-
-**Use JSON format when user asks for:**
-- Parameters, fields, or specifications (e.g., "get the header parameters", "what are the required fields")
-- Prices, numbers, or structured data (e.g., "extract the pricing", "get the product details")
-- API details, endpoints, or technical specs (e.g., "find the authentication endpoint")
-- Lists of items or properties (e.g., "list the features", "get all the options")
-- Any specific piece of information from a page
-
-**Use markdown format ONLY when:**
-- User wants to read/summarize an entire article or blog post
-- User needs to see all content on a page without specific extraction
-- User explicitly asks for the full page content
-
-**Handling JavaScript-rendered pages (SPAs):**
-If JSON extraction returns empty, minimal, or just navigation content, the page is likely JavaScript-rendered or the content is on a different URL. Try these steps IN ORDER:
-1. **Add waitFor parameter:** Set \`waitFor: 5000\` to \`waitFor: 10000\` to allow JavaScript to render before extraction
-2. **Try a different URL:** If the URL has a hash fragment (#section), try the base URL or look for a direct page URL
-3. **Use firecrawl_map to find the correct page:** Large documentation sites or SPAs often spread content across multiple URLs. Use \`firecrawl_map\` with a \`search\` parameter to discover the specific page containing your target content, then scrape that URL directly.
-   Example: If scraping "https://docs.example.com/reference" fails to find webhook parameters, use \`firecrawl_map\` with \`{"url": "https://docs.example.com/reference", "search": "webhook"}\` to find URLs like "/reference/webhook-events", then scrape that specific page.
-4. **Use firecrawl_agent:** As a last resort for heavily dynamic pages where map+scrape still fails, use the agent which can autonomously navigate and research
 
 **Usage Example (JSON format - REQUIRED for specific data extraction):**
 \`\`\`json
@@ -325,7 +380,7 @@ If JSON extraction returns empty, minimal, or just navigation content, the page 
   }
 }
 \`\`\`
-**Usage Example (markdown format - ONLY when full content genuinely needed):**
+**Usage Example (markdown format):**
 \`\`\`json
 {
   "name": "firecrawl_scrape",
@@ -336,18 +391,6 @@ If JSON extraction returns empty, minimal, or just navigation content, the page 
   }
 }
 \`\`\`
-**Usage Example (branding format - extract brand identity):**
-\`\`\`json
-{
-  "name": "firecrawl_scrape",
-  "arguments": {
-    "url": "https://example.com",
-    "formats": ["branding"]
-  }
-}
-\`\`\`
-**Branding format:** Extracts comprehensive brand identity (colors, fonts, typography, spacing, logo, UI components) for design analysis or style replication.
-**Performance:** Add maxAge parameter for 500% faster scrapes using cached data.
 **Returns:** JSON structured data, markdown, branding profile, or other formats as specified.
 ${
   SAFE_MODE
@@ -356,23 +399,7 @@ ${
 }
 `,
   parameters: scrapeParamsSchema,
-  execute: async (
-    args: unknown,
-    { session, log }: { session?: SessionData; log: Logger }
-  ): Promise<string> => {
-    const { url, ...options } = args as { url: string } & Record<
-      string,
-      unknown
-    >;
-    const client = getClient(session);
-    const cleaned = removeEmptyTopLevel(options as Record<string, unknown>);
-    log.info('Scraping URL', { url: String(url) });
-    const res = await client.scrape(String(url), {
-      ...cleaned,
-      origin: ORIGIN,
-    } as any);
-    return asText(res);
-  },
+  execute: scrapeHandler,
 });
 
 server.addTool({
@@ -382,21 +409,10 @@ Map a website to discover all indexed URLs on the site.
 
 **Best for:** Discovering URLs on a website before deciding what to scrape; finding specific sections or pages within a large site; locating the correct page when scrape returns empty or incomplete results.
 **Not recommended for:** When you already know which specific URL you need (use scrape); when you need the content of the pages (use scrape after mapping).
-**Common mistakes:** Using crawl to discover URLs instead of map; jumping straight to firecrawl_agent when scrape fails instead of using map first to find the right page.
 
 **IMPORTANT - Use map before agent:** If \`firecrawl_scrape\` returns empty, minimal, or irrelevant content, use \`firecrawl_map\` with the \`search\` parameter to find the specific page URL containing your target content. This is faster and cheaper than using \`firecrawl_agent\`. Only use the agent as a last resort after map+scrape fails.
 
-**Prompt Example:** "Find the webhook documentation page on this API docs site."
-**Usage Example (discover all URLs):**
-\`\`\`json
-{
-  "name": "firecrawl_map",
-  "arguments": {
-    "url": "https://example.com"
-  }
-}
-\`\`\`
-**Usage Example (search for specific content - RECOMMENDED when scrape fails):**
+**Usage Example (search for specific content):**
 \`\`\`json
 {
   "name": "firecrawl_map",
@@ -416,23 +432,7 @@ Map a website to discover all indexed URLs on the site.
     limit: z.number().optional(),
     ignoreQueryParameters: z.boolean().optional(),
   }),
-  execute: async (
-    args: unknown,
-    { session, log }: { session?: SessionData; log: Logger }
-  ): Promise<string> => {
-    const { url, ...options } = args as { url: string } & Record<
-      string,
-      unknown
-    >;
-    const client = getClient(session);
-    const cleaned = removeEmptyTopLevel(options as Record<string, unknown>);
-    log.info('Mapping URL', { url: String(url) });
-    const res = await client.map(String(url), {
-      ...cleaned,
-      origin: ORIGIN,
-    } as any);
-    return asText(res);
-  },
+  execute: mapHandler,
 });
 
 server.addTool({
@@ -440,27 +440,9 @@ server.addTool({
   description: `
 Search the web and optionally extract content from search results. This is the most powerful web search tool available, and if available you should always default to using this tool for any web search needs.
 
-The query also supports search operators, that you can use if needed to refine the search:
-| Operator | Functionality | Examples |
----|-|-|
-| \`"\"\` | Non-fuzzy matches a string of text | \`"Firecrawl"\`
-| \`-\` | Excludes certain keywords or negates other operators | \`-bad\`, \`-site:firecrawl.dev\`
-| \`site:\` | Only returns results from a specified website | \`site:firecrawl.dev\`
-| \`inurl:\` | Only returns results that include a word in the URL | \`inurl:firecrawl\`
-| \`allinurl:\` | Only returns results that include multiple words in the URL | \`allinurl:git firecrawl\`
-| \`intitle:\` | Only returns results that include a word in the title of the page | \`intitle:Firecrawl\`
-| \`allintitle:\` | Only returns results that include multiple words in the title of the page | \`allintitle:firecrawl playground\`
-| \`related:\` | Only returns results that are related to a specific domain | \`related:firecrawl.dev\`
-| \`imagesize:\` | Only returns images with exact dimensions | \`imagesize:1920x1080\`
-| \`larger:\` | Only returns images larger than specified dimensions | \`larger:1920x1080\`
-
 **Best for:** Finding specific information across multiple websites, when you don't know which website has the information; when you need the most relevant content for a query.
-**Not recommended for:** When you need to search the filesystem. When you already know which website to scrape (use scrape); when you need comprehensive coverage of a single website (use map or crawl.
-**Common mistakes:** Using crawl or map for open-ended questions (use search instead).
-**Prompt Example:** "Find the latest research papers on AI published in 2023."
-**Sources:** web, images, news, default to web unless needed images or news.
-**Scrape Options:** Only use scrapeOptions when you think it is absolutely necessary. When you do so default to a lower limit to avoid timeouts, 5 or lower.
-**Optimal Workflow:** Search first using firecrawl_search without formats, then after fetching the results, use the scrape tool to get the content of the relevantpage(s) that you want to scrape
+**Not recommended for:** When you already know which website to scrape (use scrape).
+**Optimal Workflow:** Search first using firecrawl_search without formats, then after fetching the results, use the scrape tool to get the content of the relevant page(s).
 
 **Usage Example without formats (Preferred):**
 \`\`\`json
@@ -468,31 +450,7 @@ The query also supports search operators, that you can use if needed to refine t
   "name": "firecrawl_search",
   "arguments": {
     "query": "top AI companies",
-    "limit": 5,
-    "sources": [
-      { "type": "web" }
-    ]
-  }
-}
-\`\`\`
-**Usage Example with formats:**
-\`\`\`json
-{
-  "name": "firecrawl_search",
-  "arguments": {
-    "query": "latest AI research papers 2023",
-    "limit": 5,
-    "lang": "en",
-    "country": "us",
-    "sources": [
-      { "type": "web" },
-      { "type": "images" },
-      { "type": "news" }
-    ],
-    "scrapeOptions": {
-      "formats": ["markdown"],
-      "onlyMainContent": true
-    }
+    "limit": 5
   }
 }
 \`\`\`
@@ -510,20 +468,7 @@ The query also supports search operators, that you can use if needed to refine t
     scrapeOptions: scrapeParamsSchema.omit({ url: true }).partial().optional(),
     enterprise: z.array(z.enum(['default', 'anon', 'zdr'])).optional(),
   }),
-  execute: async (
-    args: unknown,
-    { session, log }: { session?: SessionData; log: Logger }
-  ): Promise<string> => {
-    const client = getClient(session);
-    const { query, ...opts } = args as Record<string, unknown>;
-    const cleaned = removeEmptyTopLevel(opts as Record<string, unknown>);
-    log.info('Searching', { query: String(query) });
-    const res = await client.search(query as string, {
-      ...(cleaned as any),
-      origin: ORIGIN,
-    });
-    return asText(res);
-  },
+  execute: searchHandler,
 });
 
 server.addTool({
@@ -1013,32 +958,50 @@ List browser sessions, optionally filtered by status.
   },
 });
 
-const PORT = Number(process.env.PORT || 3000);
-const HOST =
-  process.env.CLOUD_SERVICE === 'true'
-    ? '0.0.0.0'
-    : process.env.HOST || 'localhost';
-type StartArgs = Parameters<typeof server.start>[0];
-let args: StartArgs;
+export async function startServer() {
+  const PORT = Number(process.env.PORT || 3000);
+  const HOST =
+    process.env.CLOUD_SERVICE === 'true'
+      ? '0.0.0.0'
+      : process.env.HOST || 'localhost';
+  type StartArgs = Parameters<typeof server.start>[0];
+  let args: StartArgs;
 
-if (
-  process.env.CLOUD_SERVICE === 'true' ||
-  process.env.SSE_LOCAL === 'true' ||
-  process.env.HTTP_STREAMABLE_SERVER === 'true'
-) {
-  args = {
-    transportType: 'httpStream',
-    httpStream: {
-      port: PORT,
-      host: HOST,
-      stateless: true,
-    },
-  };
-} else {
-  // default: stdio
-  args = {
-    transportType: 'stdio',
-  };
+  if (
+    process.env.CLOUD_SERVICE === 'true' ||
+    process.env.SSE_LOCAL === 'true' ||
+    process.env.HTTP_STREAMABLE_SERVER === 'true'
+  ) {
+    args = {
+      transportType: 'httpStream',
+      httpStream: {
+        port: PORT,
+        host: HOST,
+        stateless: true,
+      },
+    };
+  } else {
+    // default: stdio
+    args = {
+      transportType: 'stdio',
+    };
+  }
+
+  await server.start(args);
+
+  // Initial credit check and then every hour
+  if (process.env.FIRECRAWL_API_KEY || process.env.CLOUD_SERVICE === 'true') {
+    monitorCredits().catch(() => {});
+    setInterval(() => {
+      monitorCredits().catch(() => {});
+    }, 60 * 60 * 1000);
+  }
 }
 
-await server.start(args);
+// Only start if not imported as a module (e.g. by tests)
+if (process.env.NODE_ENV !== 'test') {
+  startServer().catch((error) => {
+    console.error('Failed to start server:', error);
+    process.exit(1);
+  });
+}
