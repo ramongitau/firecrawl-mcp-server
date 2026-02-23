@@ -336,6 +336,134 @@ export async function searchHandler(
   return asText(res);
 }
 
+export async function crawlHandler(
+  args: unknown,
+  { session, log }: { session?: SessionData; log: Logger }
+): Promise<string> {
+  const { url, ...options } = args as Record<string, unknown>;
+  const client = getClient(session);
+  const cleaned = removeEmptyTopLevel(options as Record<string, unknown>);
+  log.info('Starting crawl', { url: String(url) });
+  const res = await client.crawl(String(url), {
+    ...(cleaned as any),
+    origin: ORIGIN,
+  });
+  return asText(res);
+}
+
+export async function crawlStatusHandler(
+  args: unknown,
+  { session }: { session?: SessionData }
+): Promise<string> {
+  const client = getClient(session);
+  const res = await client.getCrawlStatus((args as any).id as string);
+  return asText(res);
+}
+
+export async function extractHandler(
+  args: unknown,
+  { session, log }: { session?: SessionData; log: Logger }
+): Promise<string> {
+  const client = getClient(session);
+  const a = args as Record<string, unknown>;
+  log.info('Extracting from URLs', {
+    count: Array.isArray(a.urls) ? a.urls.length : 0,
+  });
+  const extractBody = removeEmptyTopLevel({
+    urls: a.urls as string[],
+    prompt: a.prompt as string | undefined,
+    schema: (a.schema as Record<string, unknown>) || undefined,
+    allowExternalLinks: a.allowExternalLinks as boolean | undefined,
+    enableWebSearch: a.enableWebSearch as boolean | undefined,
+    includeSubdomains: a.includeSubdomains as boolean | undefined,
+    origin: ORIGIN,
+  });
+  const res = await client.extract(extractBody as any);
+  return asText(res);
+}
+
+export async function agentHandler(
+  args: unknown,
+  { session, log }: { session?: SessionData; log: Logger }
+): Promise<string> {
+  const client = getClient(session);
+  const a = args as Record<string, unknown>;
+  log.info('Starting agent', {
+    prompt: (a.prompt as string).substring(0, 100),
+    urlCount: Array.isArray(a.urls) ? a.urls.length : 0,
+  });
+  const agentBody = removeEmptyTopLevel({
+    prompt: a.prompt as string,
+    urls: a.urls as string[] | undefined,
+    schema: (a.schema as Record<string, unknown>) || undefined,
+  });
+  const res = await (client as any).startAgent({
+    ...agentBody,
+    origin: ORIGIN,
+  });
+  return asText(res);
+}
+
+export async function agentStatusHandler(
+  args: unknown,
+  { session, log }: { session?: SessionData; log: Logger }
+): Promise<string> {
+  const client = getClient(session);
+  const { id } = args as { id: string };
+  log.info('Checking agent status', { id });
+  const res = await (client as any).getAgentStatus(id);
+  return asText(res);
+}
+
+export async function browserCreateHandler(
+  args: unknown,
+  { session, log }: { session?: SessionData; log: Logger }
+): Promise<string> {
+  const client = getClient(session);
+  const a = args as Record<string, unknown>;
+  const cleaned = removeEmptyTopLevel(a);
+  log.info('Creating browser session');
+  const res = await client.browser(cleaned as any);
+  return asText(res);
+}
+
+export async function browserExecuteHandler(
+  args: unknown,
+  { session, log }: { session?: SessionData; log: Logger }
+): Promise<string> {
+  const client = getClient(session);
+  const { sessionId, code, language } = args as {
+    sessionId: string;
+    code: string;
+    language?: 'python' | 'node' | 'bash';
+  };
+  log.info('Executing code in browser session', { sessionId });
+  const res = await client.browserExecute(sessionId, { code, language });
+  return asText(res);
+}
+
+export async function browserDeleteHandler(
+  args: unknown,
+  { session, log }: { session?: SessionData; log: Logger }
+): Promise<string> {
+  const client = getClient(session);
+  const { sessionId } = args as { sessionId: string };
+  log.info('Deleting browser session', { sessionId });
+  const res = await client.deleteBrowser(sessionId);
+  return asText(res);
+}
+
+export async function browserListHandler(
+  args: unknown,
+  { session, log }: { session?: SessionData; log: Logger }
+): Promise<string> {
+  const client = getClient(session);
+  const { status } = args as { status?: 'active' | 'destroyed' };
+  log.info('Listing browser sessions', { status });
+  const res = await client.listBrowsers({ status });
+  return asText(res);
+}
+
 server.addTool({
   name: 'firecrawl_scrape',
   description: `
@@ -532,17 +660,7 @@ server.addTool({
     ignoreQueryParameters: z.boolean().optional(),
     scrapeOptions: scrapeParamsSchema.omit({ url: true }).partial().optional(),
   }),
-  execute: async (args, { session, log }) => {
-    const { url, ...options } = args as Record<string, unknown>;
-    const client = getClient(session);
-    const cleaned = removeEmptyTopLevel(options as Record<string, unknown>);
-    log.info('Starting crawl', { url: String(url) });
-    const res = await client.crawl(String(url), {
-      ...(cleaned as any),
-      origin: ORIGIN,
-    });
-    return asText(res);
-  },
+  execute: crawlHandler,
 });
 
 server.addTool({
@@ -562,14 +680,7 @@ Check the status of a crawl job.
 **Returns:** Status and progress of the crawl job, including results if available.
 `,
   parameters: z.object({ id: z.string() }),
-  execute: async (
-    args: unknown,
-    { session }: { session?: SessionData }
-  ): Promise<string> => {
-    const client = getClient(session);
-    const res = await client.getCrawlStatus((args as any).id as string);
-    return asText(res);
-  },
+  execute: crawlStatusHandler,
 });
 
 server.addTool({
@@ -619,27 +730,7 @@ Extract structured information from web pages using LLM capabilities. Supports b
     enableWebSearch: z.boolean().optional(),
     includeSubdomains: z.boolean().optional(),
   }),
-  execute: async (
-    args: unknown,
-    { session, log }: { session?: SessionData; log: Logger }
-  ): Promise<string> => {
-    const client = getClient(session);
-    const a = args as Record<string, unknown>;
-    log.info('Extracting from URLs', {
-      count: Array.isArray(a.urls) ? a.urls.length : 0,
-    });
-    const extractBody = removeEmptyTopLevel({
-      urls: a.urls as string[],
-      prompt: a.prompt as string | undefined,
-      schema: (a.schema as Record<string, unknown>) || undefined,
-      allowExternalLinks: a.allowExternalLinks as boolean | undefined,
-      enableWebSearch: a.enableWebSearch as boolean | undefined,
-      includeSubdomains: a.includeSubdomains as boolean | undefined,
-      origin: ORIGIN,
-    });
-    const res = await client.extract(extractBody as any);
-    return asText(res);
-  },
+  execute: extractHandler,
 });
 
 server.addTool({
@@ -714,27 +805,7 @@ Then poll with \`firecrawl_agent_status\` every 15-30 seconds for at least 2-3 m
     urls: z.array(z.string().url()).optional(),
     schema: z.record(z.string(), z.any()).optional(),
   }),
-  execute: async (
-    args: unknown,
-    { session, log }: { session?: SessionData; log: Logger }
-  ): Promise<string> => {
-    const client = getClient(session);
-    const a = args as Record<string, unknown>;
-    log.info('Starting agent', {
-      prompt: (a.prompt as string).substring(0, 100),
-      urlCount: Array.isArray(a.urls) ? a.urls.length : 0,
-    });
-    const agentBody = removeEmptyTopLevel({
-      prompt: a.prompt as string,
-      urls: a.urls as string[] | undefined,
-      schema: (a.schema as Record<string, unknown>) || undefined,
-    });
-    const res = await (client as any).startAgent({
-      ...agentBody,
-      origin: ORIGIN,
-    });
-    return asText(res);
-  },
+  execute: agentHandler,
 });
 
 server.addTool({
@@ -765,16 +836,7 @@ Check the status of an agent job and retrieve results when complete. Use this to
 **Returns:** Status, progress, and results (if completed) of the agent job.
 `,
   parameters: z.object({ id: z.string() }),
-  execute: async (
-    args: unknown,
-    { session, log }: { session?: SessionData; log: Logger }
-  ): Promise<string> => {
-    const client = getClient(session);
-    const { id } = args as { id: string };
-    log.info('Checking agent status', { id });
-    const res = await (client as any).getAgentStatus(id);
-    return asText(res);
-  },
+  execute: agentStatusHandler,
 });
 
 // Browser session tools
@@ -805,17 +867,7 @@ Create a persistent browser session for code execution via CDP (Chrome DevTools 
     activityTtl: z.number().min(10).max(3600).optional(),
     streamWebView: z.boolean().optional(),
   }),
-  execute: async (
-    args: unknown,
-    { session, log }: { session?: SessionData; log: Logger }
-  ): Promise<string> => {
-    const client = getClient(session);
-    const a = args as Record<string, unknown>;
-    const cleaned = removeEmptyTopLevel(a);
-    log.info('Creating browser session');
-    const res = await client.browser(cleaned as any);
-    return asText(res);
-  },
+  execute: browserCreateHandler,
 });
 
 if (!SAFE_MODE) {
@@ -879,20 +931,7 @@ Execute code in a browser session. Supports agent-browser commands (bash), Pytho
       code: z.string(),
       language: z.enum(['bash', 'python', 'node']).optional(),
     }),
-    execute: async (
-      args: unknown,
-      { session, log }: { session?: SessionData; log: Logger }
-    ): Promise<string> => {
-      const client = getClient(session);
-      const { sessionId, code, language } = args as {
-        sessionId: string;
-        code: string;
-        language?: 'python' | 'node' | 'bash';
-      };
-      log.info('Executing code in browser session', { sessionId });
-      const res = await client.browserExecute(sessionId, { code, language });
-      return asText(res);
-    },
+    execute: browserExecuteHandler,
   });
 }
 
@@ -915,16 +954,7 @@ Destroy a browser session.
   parameters: z.object({
     sessionId: z.string(),
   }),
-  execute: async (
-    args: unknown,
-    { session, log }: { session?: SessionData; log: Logger }
-  ): Promise<string> => {
-    const client = getClient(session);
-    const { sessionId } = args as { sessionId: string };
-    log.info('Deleting browser session', { sessionId });
-    const res = await client.deleteBrowser(sessionId);
-    return asText(res);
-  },
+  execute: browserDeleteHandler,
 });
 
 server.addTool({
@@ -946,16 +976,7 @@ List browser sessions, optionally filtered by status.
   parameters: z.object({
     status: z.enum(['active', 'destroyed']).optional(),
   }),
-  execute: async (
-    args: unknown,
-    { session, log }: { session?: SessionData; log: Logger }
-  ): Promise<string> => {
-    const client = getClient(session);
-    const { status } = args as { status?: 'active' | 'destroyed' };
-    log.info('Listing browser sessions', { status });
-    const res = await client.listBrowsers({ status });
-    return asText(res);
-  },
+  execute: browserListHandler,
 });
 
 export async function startServer() {
